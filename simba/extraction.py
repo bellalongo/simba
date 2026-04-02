@@ -196,79 +196,72 @@ def extract_multi_sweep(
         'f_IF'          : per-tooth IF axis (Hz)
         'mini_spectra'  : per-tooth phase-interleaved mini-spectra
     """
-    N_st = len(f_comb)
-    Nps = Nt_sw // N_st  # samples per step
+    N_st   = len(f_comb)
+    Nps    = Nt_sw // N_st
+    T_sw   = Nt_sw * dt
+    T_tot  = N_sw * T_sw
+    omega_rep = 2.0 * np.pi / T_tot          # fine-grid spacing
 
-    f_IF_step = np.fft.fftshift(np.fft.fftfreq(Nps, d=dt))
+    f_IF_step  = np.fft.fftshift(np.fft.fftfreq(Nps, d=dt))
     guard_mask = np.abs(f_IF_step) < f_rep / 2.0
-
-    # Sweep DFT twiddle array
     r_arr = np.arange(N_sw)
 
-    # For phase interleaving, the fine-grid offset s_n for each tooth
-    # is determined by the CRT bijection.  For the general case:
-    #   n = q_n * N_sw + s_n
-    # where q_n selects the coarse bin (tooth) and s_n is the fine offset.
-    # For a stepped LO with N_st steps and N_sw sweeps:
-    #   N_total = N_st * N_sw  fine-grid bins total.
-    #   The mapping  u = (p * N_sw + r) mod N_total  gives the CRT bijection
-    #   when gcd(N_st, N_sw) = 1.
-
-    f_optical_list = []
-    Ps_list = []
-    mini_spectra = {}
-
-    T_sw = Nt_sw * dt
+    f_optical_list, Ps_list, mini_spectra = [], [], {}
 
     for p in range(N_st):
-        j0 = p * Nps
-        j1 = (p + 1) * Nps
+        j0  = p * Nps
+        j1  = (p + 1) * Nps
+        tau = dt * np.arange(Nps)
 
-        # Per-step FFT for each sweep
+        # Per-sweep FFT of the raw (baseband) interferogram
+        # ---------------------------------------------------
+        # The carrier exp(i*2*pi*f_p*tau) was already removed by mixing.
+        # DO NOT divide by exp(-i*2*pi*f_p*tau) here — that would
+        # up-convert the IF signal to optical frequency and alias it
+        # outside the guard band.
         F_sweeps = np.zeros((N_sw, Nps), dtype=np.complex128)
-
         for r in range(N_sw):
-            I_pr = interferogram[j0:j1, r]
-
+            I_pr = interferogram[j0:j1, r].copy()
             if detector is not None:
                 I_pr = detector.deconvolve(I_pr, dt)
-
             F_sweeps[r] = np.fft.fftshift(np.fft.fft(I_pr)) / Nps
 
-        # --- Sweep DFT for each fine offset s_n ---
         for s_n in range(N_sw):
-            # Twiddle: exp(+2*pi*i * s_n * r / N_sw)
-            # (positive sign for heterodyne signal, see V4.0 Table 1 note)
-            twiddle = np.exp(+2j * np.pi * s_n * r_arr / N_sw)
+            # Inner Cooley-Tukey twiddle (V4.0 correction):
+            # centers the inner DFT at the fine-grid frequency
+            # omega_n^(c) = omega_k + s_n * omega_rep.
+            # For baseband signal at IF f_IF = k0/T_step + s_n/T_tot,
+            # this removes the sub-bin phase from the inner sum.
+            fine_twiddle = np.exp(-1j * s_n * omega_rep * tau)  # shape (Nps,)
 
-            # Sweep DFT:  (1/N_sw) sum_r twiddle * F_r
-            S_fine = (1.0 / N_sw) * np.einsum('r,rk->k', twiddle, F_sweeps)
+            F_tw = np.zeros((N_sw, Nps), dtype=np.complex128)
+            for r in range(N_sw):
+                F_tw[r] = np.fft.fftshift(
+                    np.fft.fft(
+                        (interferogram[j0:j1, r] * fine_twiddle)
+                    )
+                ) / Nps
 
-            # Power: divide by |E0|^2
-            P_fine = np.abs(S_fine) ** 2 / (np.abs(E0) ** 2)
+            # Outer sweep DFT — negative twiddle (corrected sign)
+            # Signal inter-sweep phase: exp(+2*pi*i*s_n*r/N_sw)
+            # Extraction twiddle must be conjugate: exp(-2*pi*i*s_n*r/N_sw)
+            sweep_tw = np.exp(-2j * np.pi * s_n * r_arr / N_sw)
+            S_fine   = (1.0 / N_sw) * np.einsum('r,rk->k', sweep_tw, F_tw)
+            P_fine   = np.abs(S_fine) ** 2 / (np.abs(E0) ** 2)
 
-            # Fine-grid frequency offset
-            f_fine_offset = s_n / (N_sw * T_sw)
-
-            # Stitch: optical freq = comb tooth + IF + fine offset
-            f_opt = f_comb[p] + f_IF_step[guard_mask] + f_fine_offset
-
+            f_opt = f_comb[p] + f_IF_step[guard_mask] + s_n / T_tot
             f_optical_list.append(f_opt)
             Ps_list.append(P_fine[guard_mask])
 
-        mini_spectra[p] = np.abs(
-            (1.0 / N_sw) * np.einsum('r,rk->k',
-                                      np.ones(N_sw), F_sweeps)
-        ) ** 2 / (np.abs(E0) ** 2)
+        # Diagnostic mini-spectrum (s_n = 0, mean power over sweeps)
+        mini_spectra[p] = np.mean(np.abs(F_sweeps) ** 2, axis=0) / (np.abs(E0) ** 2)
 
-    f_optical = np.concatenate(f_optical_list)
+    f_optical   = np.concatenate(f_optical_list)
     Ps_stitched = np.concatenate(Ps_list)
-
-    sort_idx = np.argsort(f_optical)
-
+    idx         = np.argsort(f_optical)
     return {
-        'f_optical': f_optical[sort_idx],
-        'Ps_stitched': Ps_stitched[sort_idx],
-        'f_IF': f_IF_step,
+        'f_optical'   : f_optical[idx],
+        'Ps_stitched' : Ps_stitched[idx],
+        'f_IF'        : f_IF_step,
         'mini_spectra': mini_spectra,
     }

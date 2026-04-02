@@ -160,10 +160,19 @@ def run_swept_lo(
     # Four Lorentzian lines, 1 GHz FWHM each, power-scaled by sqrt(LO_PWR).
     # Index k = 0,...,3.
 
-    fs    = np.array([4.211, 4.558, 4.783, 4.803]) * 1e12    # carrier freq (Hz)
-    As    = np.array([1.0,   1.5,   2.0,   2.5  ]) * 1e-5    # amplitudes (V/m)
-    FWHMs = np.array([10e6,  10e6,  10e6,  10e6 ]) * 10 * 100 # 1 GHz each
-    As    = As * np.sqrt(LO_PWR)  # power scaling (matches testin3 convention)
+    # fs    = np.array([4.211, 4.558, 4.783, 4.803]) * 1e12    # carrier freq (Hz)
+    # As    = np.array([1.0,   1.5,   2.0,   2.5  ]) * 1e-5    # amplitudes (V/m)
+    # FWHMs = np.array([10e6,  10e6,  10e6,  10e6 ]) * 10 * 100 # 1 GHz each
+    # As    = As * np.sqrt(LO_PWR)  # power scaling (matches testin3 convention)
+    N_sw_test = 5   # must match N_sw passed to run_swept_lo below
+    fs = np.array([
+        4.210e12 + 1.0e9 + 0 * fr1 / N_sw_test,   # IF = 1.0 GHz + 0 * 2 GHz → s_n = 0
+        4.560e12 - 2.0e9 + 1 * fr1 / N_sw_test,   # IF = -2.0 GHz + 2 GHz  → s_n = 1
+        4.780e12 + 3.0e9 + 2 * fr1 / N_sw_test,   # IF = 3.0 GHz + 4 GHz   → s_n = 2
+        4.800e12 + 3.0e9 + 3 * fr1 / N_sw_test,   # IF = 3.0 GHz + 6 GHz   → s_n = 3
+    ])
+    As    = np.array([1.0, 1.5, 2.0, 2.5]) * 1e-5
+    FWHMs = np.array([10e6, 10e6, 10e6, 10e6]) * 10 * 100
 
     # ----------------------------------------------------------------
     # 3.  TIMING   (mirrors testin3.py derivation)
@@ -217,6 +226,7 @@ def run_swept_lo(
     IF_psd_acc    = 0.0
 
     for it in tqdm(range(NITER), desc='Averaging iterations'):
+        print(it)
 
         # 5a.  Signal envelopes
         # env_k[m] = As[k] * exp(i * phi_k(m))
@@ -291,9 +301,13 @@ def run_swept_lo(
             Ps_theory += Lfcn2(f_opt, fs[k], As[k], 1.0, FWHMs[k], Nt_per_step, dt)
 
         # Diagnostic: IF PSD of first tooth in first sweep (should show peaks)
-        I_tooth0 = I[:Nt_per_step, 0]
-        F_if     = np.fft.fftshift(np.fft.fft(I_tooth0)) / Nt_per_step
-        IF_psd_acc   += np.abs(F_if) ** 2
+        # I_tooth0 = I[:Nt_per_step, 0]
+        # F_if     = np.fft.fftshift(np.fft.fft(I_tooth0)) / Nt_per_step
+        # IF_psd_acc   += np.abs(F_if) ** 2
+        p_diag   = int(np.argmin(np.abs(fs[0] - f_comb)))
+        I_diag   = I[p_diag * Nt_per_step : (p_diag + 1) * Nt_per_step, 0]
+        F_if     = np.fft.fftshift(np.fft.fft(I_diag)) / Nt_per_step
+        IF_psd_acc += np.abs(F_if) ** 2 / E0**2
 
         Ps_recon_acc  += Ps_recon
         Ps_theory_acc += Ps_theory
@@ -302,6 +316,13 @@ def run_swept_lo(
     Ps_recon_mean  = Ps_recon_acc  / NITER
     Ps_theory_mean = Ps_theory_acc / NITER
     IF_psd_mean    = IF_psd_acc    / NITER
+
+    # PRINT CHECKING
+    peak_idx    = np.argmax(Ps_theory_mean)
+    peak_theory = Ps_theory_mean[peak_idx]
+    peak_recon  = Ps_recon_mean[peak_idx]
+    print(f"Peak theory: {peak_theory:.4e},  Peak recon: {peak_recon:.4e},  "
+        f"Relative error: {abs(peak_recon - peak_theory)/peak_theory * 100:.2f}%")
 
     f_IF_diag = np.fft.fftshift(np.fft.fftfreq(Nt_per_step, d=dt))
 
@@ -424,7 +445,7 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     run_swept_lo(
         seed          = 0,
-        N_sw          = 1,
+        N_sw          = 20,
         NITER         = 1,
         SAVE_PATH     = None,
         SMOOTH_N      = 200,
