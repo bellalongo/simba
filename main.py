@@ -73,8 +73,8 @@ def boxcar_valid(y, N):
 
 def run_swept_lo(
     seed          = 0,
-    N_sw          = 1,
-    NITER         = 1,
+    N_sw          = 100,
+    NITER         = 10,
     SAVE_PATH     = None,
     SMOOTH_N      = 200,
     show_per_tooth= True,

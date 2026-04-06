@@ -74,7 +74,7 @@ def extract_single_sweep(
     Nps  = Nt_sw // N_st          # samples per step (= Nt_per_step)
 
     f_IF = np.fft.fftshift(np.fft.fftfreq(Nps, d=dt))
-    guard = np.abs(f_IF) < f_rep / 2.0
+    guard = np.abs(f_IF) <= f_rep / 2.0
 
     f_opt_list, Ps_list, mini_spectra = [], [], {}
 
@@ -155,7 +155,7 @@ def extract_multi_sweep(
     T_sw = Nt_sw * dt
 
     f_IF  = np.fft.fftshift(np.fft.fftfreq(Nps, d=dt))
-    guard = np.abs(f_IF) < f_rep / 2.0
+    guard = np.abs(f_IF) <= f_rep / 2.0
 
     f_rep_fine = 1.0 / (N_sw * T_sw)   # fine-grid spacing = 1 / T_total
     r_arr      = np.arange(N_sw)
