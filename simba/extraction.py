@@ -1,44 +1,63 @@
-# extraction.py  — corrected
+# extraction_fixed.py
 """
-Spectral extraction for the swept-LO simulation.
+Corrected spectral extraction for the swept-LO simulation.
 
-Two approaches:
+Bug fixed (Cooley-Tukey twiddle factor)
+----------------------------------------
+The original extract_multi_sweep computed the per-step FFT at COARSE-GRID
+frequencies  exp(-i 2pi k j / Nps)  and then applied the sweep DFT.
+This is the algorithm from V4.0 Eq. (178), which the Corrected Master
+Equation document identifies as WRONG because it drops the Cooley-Tukey
+twiddle factor.
 
-(A) extract_single_sweep  — per-tooth FFT, single sweep, H=1.
-    f_optical = f_comb[p] + f_IF  (stitching).
-    Analytic: Lfcn2(f_opt, fs[k], As[k], 1.0, FWHM, Nt_per_step, dt)
+The correct Cooley-Tukey decomposition of the full N_tot-point DFT is:
 
-(B) extract_multi_sweep  — sweep DFT with phase interleaving.
-    Same stitching; each coarse bin is split into N_sw fine-grid offsets.
+    a_n  =  (1/N_sw) sum_r  exp(-i 2pi s_n r / N_sw)
+            * [(1/Nps) sum_j  x[r*Nps + j]
+               * exp(-i 2pi q j / Nps)      <- coarse DFT kernel
+               * exp(-i 2pi s_n j / N_tot)  <- twiddle factor  ← WAS MISSING
+              ]
 
-    SIGN CONVENTION (derivation summary, discrete identities used):
-    ---------------------------------------------------------------
-    The interferogram during step p of sweep r carries the factor
+where  n = q * N_sw + s_n  is the fine-grid index,
+       N_tot = N_sw * Nps,
+       q = floor(n / N_sw),   s_n = n mod N_sw.
 
-        exp(+i 2pi s_n r / N_sw)          ... (inter-sweep phase from E_s)
+Equivalently, the inner sum uses the FINE-GRID frequency:
+    exp(-i omega_n^{(c)} tau_j) = exp(-i (omega_k + s_n omega_rep) tau_j)
+instead of the coarse frequency  exp(-i omega_k tau_j).
 
-    from the signal carrier. To coherently combine N_sw sweeps and
-    isolate offset s_n, the sweep DFT multiplies by the conjugate:
+The twiddle factor per sample j within a step is:
+    W_j^{s_n} = exp(-i 2pi s_n j / N_tot) = exp(-i 2pi s_n f_rep_fine tau_j)
 
-        (1/N_sw) sum_r exp(-i 2pi s_n r / N_sw) * exp(+i 2pi s_n r / N_sw)
-            = (1/N_sw) sum_r 1  =  1
+where  tau_j = j * dt  and  f_rep_fine = 1 / (N_sw * Nps * dt) = 1 / T_total.
 
-    DFT orthogonality (discrete, exact):
-        (1/N_sw) sum_{r=0}^{N_sw-1} exp(i 2pi (s - s') r / N_sw)
-            = delta_{s, s'}    for 0 <= s, s' < N_sw
+For s_n = 0 (which is ALL fine-grid offsets when N_sw = 1), the twiddle is 1
+and the bug is invisible — hence the N_sw = 1 case worked correctly.
 
-    The sign in the twiddle is NEGATIVE:  exp(-2pi i s_n r / N_sw).
+Consistency check
+-----------------
+For N_sw = 2, Nps = 8, a pure tone at fine-grid index n = 1 (q=0, s_n=1):
+    Buggy  : |S_fine[k=0]|^2 = 0.41   (wrong)
+    Fixed  : |S_fine[k=0]|^2 = 1.00   ✓
+    Full DFT: |A_1|^2         = 1.00   ✓
 
-    Analytic: Lfcn2 with Nt = Nt_per_step (= Nps = samples per step).
-    The amplitude after the sweep DFT equals a SINGLE-SWEEP FFT value
-    (coherent sum: N_sw terms each of value 1/N_sw, product = 1),
-    so the amplitude calibration is identical to the single-sweep case.
+Amplitude scaling note
+----------------------
+After the fix, for a Lorentzian envelope of FWHM = FW measured over Nps
+samples per step, the expected PSD at the peak is:
+
+    E[|S_fine[k_IF]|^2 / |E0|^2]  ≈  Lfcn2(f_signal, f_signal, As, 1.0, FW, Nps, dt)
+
+for EACH value of N_sw.  The sweep DFT is a coherent combiner of N_sw
+INDEPENDENT estimates (one per sweep), each of amplitude ~1/N_sw, summing
+to amplitude ~1 — identical to the single-sweep case.  See derivation in
+Section III of Corrected_Master_Equation_Findings.pdf.
 """
 import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# (A) Single-sweep extraction
+# (A) Single-sweep extraction   (unchanged — was already correct)
 # ---------------------------------------------------------------------------
 
 def extract_single_sweep(
@@ -56,24 +75,26 @@ def extract_single_sweep(
     Assumptions
     -----------
     A1. H(omega) = 1 (no detector correction).
-    A2. Non-overlapping: signal bandwidth per tooth < f_rep/2.
-    A3. interferogram[j] = E0* * env_m * exp(i 2pi df t_abs[j])
-        stored at absolute times t_abs = j * dt.
+    A2. Non-overlapping: signal bandwidth per tooth < f_rep / 2.
+    A3. interferogram[j] = E0* * env_m * exp(i 2pi df t_abs[j]).
     A4. Implicit periodicity: DFT treats each dwell window as periodic.
+    A5. f_comb[p] * T_sw ∈ Z for all p  (Assumption A7 of main.py).
+        Ensures exp(i 2pi f_p r T_sw) = 1, so the inter-sweep phase
+        from the LO vanishes and the signal phase dominates.
 
     Returns
     -------
     dict with keys:
-        'f_optical'  : stitched optical frequency axis (Hz)
-        'Ps_stitched': stitched power spectrum |Ê_s|² / |E0|²
-        'f_IF'       : per-tooth IF axis (Hz)
-        'mini_spectra': dict {tooth_index -> mini-spectrum array}
+        'f_optical'   : stitched optical frequency axis (Hz)
+        'Ps_stitched' : stitched power spectrum  |F_p|^2 / |E0|^2
+        'f_IF'        : per-tooth IF axis (Hz)
+        'mini_spectra': dict  {tooth_index -> mini-spectrum array}
     """
     I = interferogram.ravel()
     N_st = len(f_comb)
-    Nps  = Nt_sw // N_st          # samples per step (= Nt_per_step)
+    Nps  = Nt_sw // N_st           # samples per step
 
-    f_IF = np.fft.fftshift(np.fft.fftfreq(Nps, d=dt))
+    f_IF  = np.fft.fftshift(np.fft.fftfreq(Nps, d=dt))
     guard = np.abs(f_IF) <= f_rep / 2.0
 
     f_opt_list, Ps_list, mini_spectra = [], [], {}
@@ -85,26 +106,26 @@ def extract_single_sweep(
             I_p = detector.deconvolve(I_p, dt)
 
         # Per-step FFT  (1/Nps normalisation)
-        F_p  = np.fft.fftshift(np.fft.fft(I_p)) / Nps
-        P_p  = np.abs(F_p) ** 2 / np.abs(E0) ** 2     # divide by |E0|^2
+        F_p = np.fft.fftshift(np.fft.fft(I_p)) / Nps
+        P_p = np.abs(F_p) ** 2 / np.abs(E0) ** 2
 
         mini_spectra[p] = P_p
         f_opt_list.append(f_comb[p] + f_IF[guard])
         Ps_list.append(P_p[guard])
 
-    f_optical  = np.concatenate(f_opt_list)
+    f_optical   = np.concatenate(f_opt_list)
     Ps_stitched = np.concatenate(Ps_list)
     idx = np.argsort(f_optical)
     return {
-        'f_optical':   f_optical[idx],
-        'Ps_stitched': Ps_stitched[idx],
-        'f_IF':        f_IF,
+        'f_optical':    f_optical[idx],
+        'Ps_stitched':  Ps_stitched[idx],
+        'f_IF':         f_IF,
         'mini_spectra': mini_spectra,
     }
 
 
 # ---------------------------------------------------------------------------
-# (B) Multi-sweep extraction with corrected phase-interleaving sign
+# (B) Multi-sweep extraction — CORRECTED Cooley-Tukey twiddle factor
 # ---------------------------------------------------------------------------
 
 def extract_multi_sweep(
@@ -120,86 +141,140 @@ def extract_multi_sweep(
     """
     Sweep-DFT extraction using N_sw sweeps (phase interleaving).
 
-    Twiddle sign derivation
-    -----------------------
-    The per-step FFT of sweep r carries the r-dependent phase
+    Twiddle-factor derivation  (discrete, exact)
+    --------------------------------------------
+    The full N_tot = N_sw * Nps  point DFT of the signal  E_s(t_m)  is:
 
-        phi_r = 2pi * s_n * r / N_sw   (positive, from E_s carrier)
+        a_n = (1/N_tot) sum_{m=0}^{N_tot-1} E_s(t_m) exp(-i 2pi n m / N_tot)
 
-    [Flag: this relies on f_comb[p] * T_sw being an integer, which holds
-     when fr1 * T_sw and f_start * T_sw are both integers. Check before use.]
+    Cooley-Tukey factorisation with  n = q * N_sw + s_n,  m = r * Nps + j:
 
-    To select offset s_n by DFT orthogonality:
-        (1/N_sw) sum_r exp(-i phi_r) * exp(+i phi_r) = 1   (s matches)
-        (1/N_sw) sum_r exp(-i phi_r) * exp(+i phi_{r,wrong}) = 0  (mismatch)
+        a_n = (1/N_sw) sum_{r=0}^{N_sw-1}  exp(-i 2pi s_n r / N_sw)
+              * [(1/Nps) sum_{j=0}^{Nps-1}  E_s(r*Nps + j)
+                 * exp(-i 2pi q j / Nps)
+                 * exp(-i 2pi s_n j / N_tot)]   <- TWIDDLE FACTOR
 
-    Twiddle:  exp(-2 pi i s_n r / N_sw)  — NEGATIVE sign.
+    The twiddle factor per local sample j is:
+
+        W_j^{s_n} = exp(-i 2pi s_n j / N_tot)
+                  = exp(-i 2pi s_n f_rep_fine tau_j)
+                  = exp(-i s_n omega_rep tau_j)        [Flag A]
+
+    [Flag A] This factor encodes the sub-bin frequency shift  s_n * f_rep_fine
+    that distinguishes fine-grid bins within a single coarse bin.
+    It vanishes for s_n = 0, making N_sw = 1 a degenerate correct case.
+
+    DFT orthogonality (discrete, exact):
+        (1/N_sw) sum_{r=0}^{N_sw-1} exp(i 2pi (s - s_n) r / N_sw)
+            = delta_{s, s_n}    for  0 <= s, s_n < N_sw            [Flag B]
+
+    [Flag B] The outer sum over r uses EXACT discrete orthogonality,
+    not an approximation or continuous Dirac delta.
+
+    Amplitude prediction (consistency check)
+    ----------------------------------------
+    After the fix, for a Lorentzian signal with As and FWHM = FW:
+
+        E[|S_fine[k_IF]|^2 / |E0|^2]  =  Lfcn2(fk, f_signal, As, 1.0, FW, Nps, dt)
+
+    independent of N_sw.  The sweep DFT's coherent combination of N_sw sweeps
+    gives amplitude equal to one sweep's contribution (each sweep contributes
+    1/N_sw, N_sw of them sum to 1), matching the single-sweep prediction.
 
     Parameters
     ----------
     interferogram : (Nt_sw, N_sw) array
-        Heterodyne signal.  Column r = sweep r.
+        Heterodyne signal.  Column r = sweep r.  Built by mixing.py.
     f_comb : (N_st,) array
-    E0     : LO field amplitude
-    Nt_sw  : samples per sweep
-    dt     : sampling interval
-    f_rep  : coarse LO step spacing (Hz)
-    N_sw   : number of sweeps
+        LO step frequencies (Hz).
+    E0     : float
+        LO field amplitude.
+    Nt_sw  : int
+        Samples per sweep  = N_st * Nps.
+    dt     : float
+        Sampling interval (s).
+    f_rep  : float
+        Coarse LO step spacing (Hz)  = 1 / T_step.
+    N_sw   : int
+        Number of sweeps.
+    detector : optional
+        Detector object with a .deconvolve(I, dt) method.
 
     Returns
     -------
     dict with same keys as extract_single_sweep.
     """
-    N_st = len(f_comb)
-    Nps  = Nt_sw // N_st          # samples per step
-    T_sw = Nt_sw * dt
+    N_st       = len(f_comb)
+    Nps        = Nt_sw // N_st          # samples per step
+    T_sw       = Nt_sw * dt             # sweep duration
+    T_total    = N_sw * T_sw            # full measurement duration
+    f_rep_fine = 1.0 / T_total          # fine-grid spacing = 1 / T_total
 
     f_IF  = np.fft.fftshift(np.fft.fftfreq(Nps, d=dt))
     guard = np.abs(f_IF) <= f_rep / 2.0
 
-    f_rep_fine = 1.0 / (N_sw * T_sw)   # fine-grid spacing = 1 / T_total
-    r_arr      = np.arange(N_sw)
+    r_arr = np.arange(N_sw)
+    tau_j = np.arange(Nps) * dt         # local time axis within a step
 
-    f_opt_list, Ps_list = [], []
+    f_opt_list = []
+    Ps_list    = []
     mini_spectra = {}
 
     for p in range(N_st):
         j0, j1 = p * Nps, (p + 1) * Nps
 
-        # Per-step FFT for each sweep r
-        F_sweeps = np.zeros((N_sw, Nps), dtype=np.complex128)
+        # --- For each fine-grid offset s_n, apply the twiddle BEFORE FFT ---
+        # This is more expensive (one FFT per s_n per step) but exact.
+        # Alternatives: chirp-Z transform or NUFFT for efficiency.
+
+        # First, load all sweep data for this step (apply detector if any)
+        I_step = np.zeros((N_sw, Nps), dtype=np.complex128)
         for r in range(N_sw):
             I_pr = interferogram[j0:j1, r]
             if detector is not None:
                 I_pr = detector.deconvolve(I_pr, dt)
-            F_sweeps[r] = np.fft.fftshift(np.fft.fft(I_pr)) / Nps
+            I_step[r] = I_pr
 
-        # Sweep DFT for each fine-grid offset s_n = 0,...,N_sw-1
+        # Coarse FFT (s_n = 0 case, used for mini_spectra display)
+        F_coarse = np.zeros((N_sw, Nps), dtype=np.complex128)
+        for r in range(N_sw):
+            F_coarse[r] = np.fft.fftshift(np.fft.fft(I_step[r])) / Nps
+        twiddle0        = np.ones(N_sw)
+        S_coarse        = (1.0 / N_sw) * (twiddle0 @ F_coarse)
+        mini_spectra[p] = np.abs(S_coarse) ** 2 / np.abs(E0) ** 2
+
+        # Fine-grid sweep DFT with Cooley-Tukey twiddle
         for s_n in range(N_sw):
-            # NEGATIVE sign: cancels the +s_n phase carried by F_sweeps
-            # DFT orthogonality:
-            #   (1/N_sw) sum_r exp(-i2pi s_n r/N_sw) exp(+i2pi s_n r/N_sw) = 1
-            #   (1/N_sw) sum_r exp(-i2pi s_n r/N_sw) exp(+i2pi s' r/N_sw) = 0  (s'!=s_n)
-            twiddle = np.exp(-2j * np.pi * s_n * r_arr / N_sw)   # ← CORRECTED sign
-            S_fine  = (1.0 / N_sw) * (twiddle @ F_sweeps)        # shape (Nps,)
-            P_fine  = np.abs(S_fine) ** 2 / np.abs(E0) ** 2
+            # --- Cooley-Tukey twiddle factor (inner, per local sample j) ---
+            # W_j = exp(-i 2pi s_n f_rep_fine tau_j)
+            # This shifts the effective DFT frequency from omega_k to
+            # omega_k + s_n * omega_rep  (the fine-grid frequency).
+            W_inner = np.exp(-2j * np.pi * s_n * f_rep_fine * tau_j)  # (Nps,)
 
-            # Optical frequency = comb tooth + IF + fine-grid offset
+            # Per-step FFT at the FINE-GRID frequency for offset s_n
+            F_fine = np.zeros((N_sw, Nps), dtype=np.complex128)
+            for r in range(N_sw):
+                # Apply twiddle in time domain, then FFT
+                F_fine[r] = np.fft.fftshift(np.fft.fft(I_step[r] * W_inner)) / Nps
+
+            # --- Outer sweep DFT (inter-sweep phase, exact DFT orthogonality) ---
+            # Phase convention: signal carries exp(+i 2pi s_n r / N_sw)
+            # from the carrier at the coarse bin.  Conjugate twiddle cancels it.
+            twiddle_outer = np.exp(-2j * np.pi * s_n * r_arr / N_sw)  # (N_sw,)
+            S_fine        = (1.0 / N_sw) * (twiddle_outer @ F_fine)   # (Nps,)
+            P_fine        = np.abs(S_fine) ** 2 / np.abs(E0) ** 2
+
+            # Optical frequency: comb tooth + coarse IF + fine-grid sub-bin offset
             f_opt = f_comb[p] + f_IF[guard] + s_n * f_rep_fine
             f_opt_list.append(f_opt)
             Ps_list.append(P_fine[guard])
 
-        # Coarse mini-spectrum for this tooth (s_n=0 only, for display)
-        twiddle0       = np.ones(N_sw)
-        S_coarse       = (1.0 / N_sw) * (twiddle0 @ F_sweeps)
-        mini_spectra[p] = np.abs(S_coarse) ** 2 / np.abs(E0) ** 2
-
-    f_optical  = np.concatenate(f_opt_list)
+    f_optical   = np.concatenate(f_opt_list)
     Ps_stitched = np.concatenate(Ps_list)
     idx = np.argsort(f_optical)
     return {
-        'f_optical':   f_optical[idx],
-        'Ps_stitched': Ps_stitched[idx],
-        'f_IF':        f_IF,
+        'f_optical':    f_optical[idx],
+        'Ps_stitched':  Ps_stitched[idx],
+        'f_IF':         f_IF,
         'mini_spectra': mini_spectra,
     }

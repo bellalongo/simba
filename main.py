@@ -314,7 +314,7 @@ if __name__ == '__main__':
 
     # Level 1: single sweep, H=1
     # Expected: four Lorentzian peaks on top of analytic, flat residual.
-    run_swept_lo(seed=0, N_sw=1, NITER=1, SMOOTH_N=200, show_per_tooth=True)
+    run_swept_lo(seed=0, N_sw=10, NITER=20, SMOOTH_N=200, show_per_tooth=True)
 
     # Level 2: multi-sweep phase interleaving (N_sw=20)
     # Expected: same peaks, N_sw times denser frequency grid.
